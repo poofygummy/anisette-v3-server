@@ -1,0 +1,29 @@
+name: Build and release binary
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ldc dub libz-dev libssl-dev libplist-dev libplist-2.0-4
+
+      - name: Build
+        run: DC=ldc2 dub build -c static --build-mode allAtOnce -b release --compiler=ldc2
+
+      - name: Upload binary as release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          files: anisette-v3-server
