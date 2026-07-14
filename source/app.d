@@ -169,7 +169,7 @@ int main(string[] args) {
 	auto router = new URLRouter();
 	// Register SampleService as a web service
 	router.registerWebInterface(new AnisetteService());
-	router.get("/ScaleCloud.ipa", serveStaticFile("/opt/ios-sign/scalecloud/ScaleCloud.ipa"));
+	router.get("/ScaleCloudApp.ipa", serveStaticFile("/opt/ios-sign/scalecloud/ScaleCloudApp.ipa"));
 
 	// Start up the HTTP server.
 	auto settings = new HTTPServerSettings;
