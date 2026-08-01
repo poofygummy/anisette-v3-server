@@ -20,7 +20,6 @@ import std.zip;
 
 import vibe.core.core;
 import vibe.http.websockets;
-import vibe.http.fileserver;
 import vibe.http.server;
 import vibe.http.router;
 import vibe.stream.tls;
@@ -169,7 +168,6 @@ int main(string[] args) {
 	auto router = new URLRouter();
 	// Register SampleService as a web service
 	router.registerWebInterface(new AnisetteService());
-	router.get("/ScaleCloudApp.ipa", serveStaticFile("/opt/ios-sign/scalecloud/ScaleCloudApp.ipa"));
 
 	// Start up the HTTP server.
 	auto settings = new HTTPServerSettings;
