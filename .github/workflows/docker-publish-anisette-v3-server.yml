@@ -1,9 +1,6 @@
 name: Publish docker image anisette-v3-server
 
 on:
-  push:
-    branches:
-      - 'main'
   workflow_dispatch:
 
 jobs:
