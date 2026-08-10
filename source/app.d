@@ -4,6 +4,7 @@ import core.memory;
 import std.algorithm.searching;
 import std.array;
 import std.base64;
+import std.conv;
 import std.digest;
 import file = std.file;
 import std.format;
@@ -44,6 +45,11 @@ __gshared ADI v1Adi;
 __gshared Device v1Device;
 
 __gshared Duration timeout;
+
+// Pairing receiver — started/stopped on demand via /internal/pairing-open and /internal/pairing-close
+__gshared HTTPListener pairingListener;
+__gshared bool pairingActive = false;
+__gshared string pairingBindHostname;
 
 int main(string[] args) {
 	debug {
@@ -182,7 +188,22 @@ int main(string[] args) {
 		settings.tlsContext.usePrivateKeyFile(privateKeyPath);
 	}
 
+	// Expose pairing open/close control endpoints on the main :6969 router
+	router.post("/internal/pairing-open",  &handlePairingOpen);
+	router.post("/internal/pairing-close", &handlePairingClose);
+
+	// Store the hostname so the on-demand pairing listener uses the same bind address
+	pairingBindHostname = hostname;
+
 	auto listener = listenHTTP(settings, router);
+
+	// Auth server — always-on, port :6971
+	auto authRouter = new URLRouter();
+	authRouter.post("/auth", &handleAuth);
+	auto authSettings = new HTTPServerSettings;
+	authSettings.port = 6971;
+	authSettings.bindAddresses = [hostname];
+	auto authListener = listenHTTP(authSettings, authRouter);
 
 	return runApplication(&args);
 }
@@ -441,6 +462,222 @@ class AnisetteService {
 
 		log.infoF!"[>> %s] Okay all right here is your provisioning data."(requestUUID);
 		socket.send(response.toString(JSONOptions.doNotEscapeSlashes));
+	}
+}
+
+// =============================================================================
+// Pairing listener control — POST :6969/internal/pairing-open
+//                            POST :6969/internal/pairing-close
+//
+// tsnode-ident.sh calls pairing-open when ios-pairing-transmitter connects
+// and pairing-close when it disconnects (or after a successful transfer).
+// This starts/stops the :6970 listener on demand, matching the old behaviour
+// where ios-pairing-receiver.sh was only launched when the transmitter was
+// detected.
+// =============================================================================
+void handlePairingOpen(HTTPServerRequest req, HTTPServerResponse res) {
+	auto log = getLogger();
+	if (pairingActive) {
+		log.info("[*] pairing-open: already active, ignoring");
+		res.statusCode = 200;
+		res.writeBody("already open", "text/plain");
+		return;
+	}
+
+	auto pairingRouter = new URLRouter();
+	pairingRouter.post("/ios-pairing-receiver", &handlePairing);
+	auto pairingSettings = new HTTPServerSettings;
+	pairingSettings.port = 6970;
+	pairingSettings.bindAddresses = [pairingBindHostname];
+
+	try {
+		pairingListener = listenHTTP(pairingSettings, pairingRouter);
+		pairingActive = true;
+		log.info("[+] pairing-open: listening on :6970");
+		res.statusCode = 200;
+		res.writeBody("opened", "text/plain");
+	} catch (Exception e) {
+		log.errorF!"[-] pairing-open: failed to bind :6970: %s"(e.msg);
+		res.statusCode = 500;
+		res.writeBody("failed to open", "text/plain");
+	}
+}
+
+void handlePairingClose(HTTPServerRequest req, HTTPServerResponse res) {
+	auto log = getLogger();
+	if (!pairingActive) {
+		log.info("[*] pairing-close: not active, ignoring");
+		res.statusCode = 200;
+		res.writeBody("already closed", "text/plain");
+		return;
+	}
+
+	try {
+		pairingListener.stopListening();
+		pairingActive = false;
+		log.info("[+] pairing-close: :6970 closed");
+		res.statusCode = 200;
+		res.writeBody("closed", "text/plain");
+	} catch (Exception e) {
+		log.errorF!"[-] pairing-close: failed to stop listener: %s"(e.msg);
+		res.statusCode = 500;
+		res.writeBody("failed to close", "text/plain");
+	}
+}
+
+// =============================================================================
+// Pairing receiver — port :6970 (on-demand), POST /ios-pairing-receiver
+//
+// Receives the pairing file JSON from ios-install-transmitter (via the
+// forwarded :6970 port), writes it to /var/lib/lockdown/, then opens a TCP
+// connection back to the transmitter's dynamic callback port to confirm the
+// write — exactly the same sequence the shell script performed with nc -q 1.
+// After the write and callback, closes the :6970 listener automatically.
+// =============================================================================
+void handlePairing(HTTPServerRequest req, HTTPServerResponse res) {
+	auto log = getLogger();
+	log.info("[<<] pairing receiver: POST /ios-pairing-receiver");
+
+	string udid, data, callbackIp, callbackPort;
+	try {
+		auto json = req.json();
+		udid         = json["udid"].to!string().strip('"');
+		data         = json["data"].to!string().strip('"');
+		callbackIp   = json["callback_ip"].to!string().strip('"');
+		callbackPort = json["callback_port"].to!string().strip('"');
+	} catch (Exception e) {
+		log.warnF!"[>>] pairing receiver: failed to parse JSON: %s"(e.msg);
+		res.statusCode = 400;
+		res.writeBody("Bad Request", "text/plain");
+		return;
+	}
+
+	// Validate — mirror the shell script's null/empty checks
+	if (udid.length == 0 || udid == "null") {
+		log.warn("[>>] pairing receiver: missing or null udid");
+		res.statusCode = 400;
+		res.writeBody("Bad Request: missing udid", "text/plain");
+		return;
+	}
+	if (data.length == 0 || data == "null") {
+		log.warn("[>>] pairing receiver: missing or null data");
+		res.statusCode = 400;
+		res.writeBody("Bad Request: missing data", "text/plain");
+		return;
+	}
+
+	immutable lockdownDir = "/var/lib/lockdown";
+	immutable destPath    = lockdownDir ~ "/" ~ udid;
+
+	try {
+		if (!file.exists(lockdownDir))
+			file.mkdirRecurse(lockdownDir);
+		file.write(destPath, data);
+		log.infoF!"[+] pairing receiver: wrote pairing key to %s"(destPath);
+	} catch (Exception e) {
+		log.errorF!"[>>] pairing receiver: failed to write %s: %s"(destPath, e.msg);
+		res.statusCode = 500;
+		res.writeBody("Internal Server Error", "text/plain");
+		return;
+	}
+
+	// Respond 200 first, then send the TCP callback and close the listener —
+	// matches the shell script's order: nc sends the HTTP response, then the
+	// script sends the confirmation and exits (taking down the nc listener).
+	res.statusCode = 200;
+	res.writeBody("OK", "text/plain");
+	log.infoF!"[+] pairing receiver: sending confirmation to %s:%s"(callbackIp, callbackPort);
+
+	// Async: send TCP callback then close the :6970 listener.
+	// Mirror of: echo "" | nc -q 1 "$CALLBACK_IP" "$CALLBACK_PORT" && (script exits, nc dies)
+	auto cbIp   = callbackIp;
+	auto cbPort = callbackPort;
+	runTask({
+		try {
+			import vibe.core.net : connectTCP;
+			auto conn = connectTCP(cbIp, cbPort.to!ushort);
+			conn.close();
+			log.infoF!"[+] pairing receiver: confirmation sent to %s:%s"(cbIp, cbPort);
+		} catch (Exception e) {
+			log.warnF!"[-] pairing receiver: confirmation failed: %s"(e.msg);
+		}
+		// Close the on-demand listener — equivalent to the shell script exiting
+		if (pairingActive) {
+			try {
+				pairingListener.stopListening();
+				pairingActive = false;
+				log.info("[+] pairing receiver: :6970 closed after successful transfer");
+			} catch (Exception e) {
+				log.warnF!"[-] pairing receiver: failed to close :6970 after transfer: %s"(e.msg);
+			}
+		}
+	});
+}
+
+// =============================================================================
+// Auth server — port :6971, POST /auth
+//
+// Always-on replacement for nas-auth-server.go. Accepts
+// {"username": "...", "password": "..."}, verifies credentials against the
+// Linux PAM stack by running sshpass + ssh to localhost:22 (exactly as the
+// Go server did), and returns {"ok": true} on success or 401 on failure.
+// =============================================================================
+void handleAuth(HTTPServerRequest req, HTTPServerResponse res) {
+	auto log = getLogger();
+	log.info("[<<] auth: POST /auth");
+
+	string username, password;
+	try {
+		auto json = req.json();
+		username = json["username"].to!string().strip('"');
+		password = json["password"].to!string().strip('"');
+	} catch (Exception e) {
+		log.warnF!"[>>] auth: failed to parse JSON: %s"(e.msg);
+		res.statusCode = 400;
+		res.writeBody(`{"ok":false,"message":"invalid JSON"}`, "application/json");
+		return;
+	}
+
+	// Validate — mirrors Go server's validateField checks
+	if (username.length == 0 || username == "null" || username.length > 256) {
+		log.warn("[>>] auth: invalid username");
+		res.statusCode = 400;
+		res.writeBody(`{"ok":false,"message":"invalid username"}`, "application/json");
+		return;
+	}
+	if (password.length == 0 || password == "null" || password.length > 256) {
+		log.warn("[>>] auth: invalid password");
+		res.statusCode = 400;
+		res.writeBody(`{"ok":false,"message":"invalid password"}`, "application/json");
+		return;
+	}
+
+	// sshpass + ssh to localhost:22 — identical approach to the Go server.
+	// sshpass must be installed on the NAS: apt install sshpass
+	auto result = process.execute([
+		"sshpass", "-p", password,
+		"ssh",
+		"-o", "BatchMode=no",
+		"-o", "ConnectTimeout=10",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "PasswordAuthentication=yes",
+		"-o", "PubkeyAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+		"-p", "22",
+		username ~ "@localhost",
+		"exit"
+	], null, process.Config.none, size_t.max,
+	   ["HOME": "/tmp", "PATH": "/usr/bin:/bin"]);
+
+	// Exit code 0 = auth OK; 1/5/255 = auth failed (same mapping as Go server)
+	if (result.status == 0) {
+		log.infoF!"[>>] auth: OK for user %s"(username);
+		res.statusCode = 200;
+		res.writeBody(`{"ok":true}`, "application/json");
+	} else {
+		log.infoF!"[>>] auth: FAILED for user %s (exit %d)"(username, result.status);
+		res.statusCode = 401;
+		res.writeBody(`{"ok":false,"message":"invalid credentials"}`, "application/json");
 	}
 }
 
