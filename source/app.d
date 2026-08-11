@@ -541,10 +541,10 @@ void handlePairing(HTTPServerRequest req, HTTPServerResponse res) {
 	string udid, data, callbackIp, callbackPort;
 	try {
 		auto json = req.json();
-		udid         = json["udid"].to!string().strip('"');
-		data         = json["data"].to!string().strip('"');
-		callbackIp   = json["callback_ip"].to!string().strip('"');
-		callbackPort = json["callback_port"].to!string().strip('"');
+		udid         = json["udid"].str();
+		data         = json["data"].str();
+		callbackIp   = json["callback_ip"].str();
+		callbackPort = json["callback_port"].str();
 	} catch (Exception e) {
 		log.warnF!"[>>] pairing receiver: failed to parse JSON: %s"(e.msg);
 		res.statusCode = 400;
@@ -592,23 +592,21 @@ void handlePairing(HTTPServerRequest req, HTTPServerResponse res) {
 	// Mirror of: echo "" | nc -q 1 "$CALLBACK_IP" "$CALLBACK_PORT" && (script exits, nc dies)
 	auto cbIp   = callbackIp;
 	auto cbPort = callbackPort;
-	runTask({
+	runTask(() nothrow {
 		try {
 			import vibe.core.net : connectTCP;
 			auto conn = connectTCP(cbIp, cbPort.to!ushort);
 			conn.close();
-			log.infoF!"[+] pairing receiver: confirmation sent to %s:%s"(cbIp, cbPort);
 		} catch (Exception e) {
-			log.warnF!"[-] pairing receiver: confirmation failed: %s"(e.msg);
+			// confirmation failed — best effort
 		}
 		// Close the on-demand listener — equivalent to the shell script exiting
 		if (pairingActive) {
 			try {
 				pairingListener.stopListening();
 				pairingActive = false;
-				log.info("[+] pairing receiver: :6970 closed after successful transfer");
 			} catch (Exception e) {
-				log.warnF!"[-] pairing receiver: failed to close :6970 after transfer: %s"(e.msg);
+				// ignore
 			}
 		}
 	});
@@ -629,8 +627,8 @@ void handleAuth(HTTPServerRequest req, HTTPServerResponse res) {
 	string username, password;
 	try {
 		auto json = req.json();
-		username = json["username"].to!string().strip('"');
-		password = json["password"].to!string().strip('"');
+		username = json["username"].str();
+		password = json["password"].str();
 	} catch (Exception e) {
 		log.warnF!"[>>] auth: failed to parse JSON: %s"(e.msg);
 		res.statusCode = 400;
@@ -666,8 +664,7 @@ void handleAuth(HTTPServerRequest req, HTTPServerResponse res) {
 		"-p", "22",
 		username ~ "@localhost",
 		"exit"
-	], null, process.Config.none, size_t.max,
-	   ["HOME": "/tmp", "PATH": "/usr/bin:/bin"]);
+	], ["HOME": "/tmp", "PATH": "/usr/bin:/bin"], process.Config.none, size_t.max);
 
 	// Exit code 0 = auth OK; 1/5/255 = auth failed (same mapping as Go server)
 	if (result.status == 0) {
