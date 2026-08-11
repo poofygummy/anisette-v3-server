@@ -541,10 +541,10 @@ void handlePairing(HTTPServerRequest req, HTTPServerResponse res) {
 	string udid, data, callbackIp, callbackPort;
 	try {
 		auto json = req.json();
-		udid         = json["udid"].str();
-		data         = json["data"].str();
-		callbackIp   = json["callback_ip"].str();
-		callbackPort = json["callback_port"].str();
+		udid         = json["udid"].get!string;
+		data         = json["data"].get!string;
+		callbackIp   = json["callback_ip"].get!string;
+		callbackPort = json["callback_port"].get!string;
 	} catch (Exception e) {
 		log.warnF!"[>>] pairing receiver: failed to parse JSON: %s"(e.msg);
 		res.statusCode = 400;
@@ -592,7 +592,7 @@ void handlePairing(HTTPServerRequest req, HTTPServerResponse res) {
 	// Mirror of: echo "" | nc -q 1 "$CALLBACK_IP" "$CALLBACK_PORT" && (script exits, nc dies)
 	auto cbIp   = callbackIp;
 	auto cbPort = callbackPort;
-	runTask(() nothrow {
+	runTask(() nothrow @trusted {
 		try {
 			import vibe.core.net : connectTCP;
 			auto conn = connectTCP(cbIp, cbPort.to!ushort);
@@ -627,8 +627,8 @@ void handleAuth(HTTPServerRequest req, HTTPServerResponse res) {
 	string username, password;
 	try {
 		auto json = req.json();
-		username = json["username"].str();
-		password = json["password"].str();
+		username = json["username"].get!string;
+		password = json["password"].get!string;
 	} catch (Exception e) {
 		log.warnF!"[>>] auth: failed to parse JSON: %s"(e.msg);
 		res.statusCode = 400;
